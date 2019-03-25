@@ -3,3 +3,5 @@
 dist
 vendor
 
+
+cmd/kubefwd/kubefwd

@@ -18,12 +18,13 @@ package services
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
-
-	"github.com/txn2/txeh"
 
 	"github.com/txn2/kubefwd/pkg/fwdcfg"
 	"github.com/txn2/kubefwd/pkg/fwdhost"
@@ -31,6 +32,7 @@ import (
 	"github.com/txn2/kubefwd/pkg/fwdport"
 	"github.com/txn2/kubefwd/pkg/fwdpub"
 	"github.com/txn2/kubefwd/pkg/utils"
+	"github.com/txn2/txeh"
 
 	"github.com/spf13/cobra"
 	"k8s.io/api/core/v1"
@@ -45,6 +47,9 @@ var namespaces []string
 var contexts []string
 var exitOnFail bool
 var verbose bool
+
+var iface string
+var networkRange string
 
 func init() {
 	// override error output from k8s.io/apimachinery/pkg/util/runtime
@@ -73,7 +78,8 @@ func init() {
 	Cmd.Flags().StringP("selector", "l", "", "Selector (label query) to filter on; supports '=', '==', and '!=' (e.g. -l key1=value1,key2=value2).")
 	Cmd.Flags().BoolVarP(&exitOnFail, "exitonfailure", "", false, "Exit(1) on failure. Useful for forcing a container restart.")
 	Cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output.")
-
+	Cmd.Flags().StringVar(&iface, "iface", "lo", "Network interface.")
+	Cmd.Flags().StringVar(&networkRange, "network-range", "127.1.27.1-254", "IP address allocation range.")
 }
 
 var Cmd = &cobra.Command{
@@ -88,7 +94,6 @@ var Cmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 
 		hasRoot, err := utils.CheckRoot()
-
 		if !hasRoot {
 			fmt.Printf(`
 This program requires superuser privileges to run. These
@@ -165,10 +170,6 @@ Try:
 			}
 		}
 
-		// ipC is the class C for the local IP address
-		// increment this for each cluster
-		ipC := 27
-
 		wg := &sync.WaitGroup{}
 
 		// if no context override
@@ -200,16 +201,17 @@ Try:
 					Hostfile:     hostFile,
 					ClientConfig: restConfig,
 					// only use short name for the first namespace and context
-					ShortName:  i < 1 && ii < 1,
-					Remote:     i > 0,
-					IpC:        byte(ipC),
+					ShortName: i < 1 && ii < 1,
+					Remote:    i > 0,
+
+					NetworkInterface: iface,
+					NetworkRange:     networkRange,
+
 					ExitOnFail: exitOnFail,
 				})
 				if err != nil {
 					log.Printf("Error forwarding service: %s\n", err.Error())
 				}
-
-				ipC = ipC + 1
 			}
 		}
 
@@ -234,8 +236,11 @@ type FwdServiceOpts struct {
 	ClientConfig *restclient.Config
 	ShortName    bool
 	Remote       bool
-	IpC          byte
-	ExitOnFail   bool
+
+	NetworkInterface string
+	NetworkRange     string
+
+	ExitOnFail bool
 }
 
 func fwdServices(opts FwdServiceOpts) error {
@@ -250,15 +255,12 @@ func fwdServices(opts FwdServiceOpts) error {
 		Output:        false,
 	}
 
-	d := 1
-
 	// loop through the services
 	for _, svc := range services.Items {
 		selector := mapToSelectorStr(svc.Spec.Selector)
 
 		if selector == "" {
 			log.Printf("WARNING: No backing pods for service %s in %s on cluster %s.\n", svc.Name, svc.Namespace, svc.ClusterName)
-
 			continue
 		}
 
@@ -266,32 +268,34 @@ func fwdServices(opts FwdServiceOpts) error {
 
 		if err != nil {
 			log.Printf("WARNING: No pods found for %s: %s\n", selector, err.Error())
-
 			// TODO: try again after a time
-
 			continue
 		}
 
 		if len(pods.Items) < 1 {
 			log.Printf("WARNING: No pods returned for service %s in %s on cluster %s.\n", svc.Name, svc.Namespace, svc.ClusterName)
-
 			// TODO: try again after a time
-
 			continue
 		}
 
-		podName := ""
-		podPort := ""
-		podNamespace := ""
+		localIP, err := fwdnet.Allocate(opts.NetworkRange)
+		if err != nil {
+			log.Printf("WARNING: Error getting IP address: %s\n", err.Error())
+			continue
+		}
 
-		localIp, dInc, err := fwdnet.ReadyInterface(127, 1, opts.IpC, d, podPort)
-		d = dInc
+		args := []string{"addr", "add", localIP.String(), "dev", opts.NetworkInterface}
+		if err := exec.Command("ip", args...).Run(); err != nil {
+			fmt.Printf("Cannot ifconfig %v alias %s up: %v\n", opts.NetworkInterface, localIP.String(), err)
+			os.Exit(1)
+		}
+
+		log.Printf("🔥 DNS: %v.%v.%v.xip.io", svc.Name, svc.Namespace, localIP.String())
 
 		for _, port := range svc.Spec.Ports {
-
-			podName = pods.Items[0].Name
-			podNamespace = pods.Items[0].Namespace
-			podPort = port.TargetPort.String()
+			podName := pods.Items[0].Name
+			podNamespace := pods.Items[0].Namespace
+			podPort := port.TargetPort.String()
 			localPort := strconv.Itoa(int(port.Port))
 
 			if _, err := strconv.Atoi(podPort); err != nil {
@@ -318,10 +322,10 @@ func fwdServices(opts FwdServiceOpts) error {
 			}
 
 			if verbose {
-				log.Printf("Resolving:  %s%s to %s\n",
+				log.Printf("Resolving: %s%s to %s\n",
 					svc.Name,
 					full,
-					localIp.String(),
+					localIP.String(),
 				)
 			}
 
@@ -334,20 +338,21 @@ func fwdServices(opts FwdServiceOpts) error {
 			)
 
 			pfo := &fwdport.PortForwardOpts{
-				Out:        publisher,
-				Config:     opts.ClientConfig,
-				ClientSet:  opts.ClientSet,
-				Context:    opts.Context,
-				Namespace:  podNamespace,
-				Service:    svc.Name,
-				PodName:    podName,
-				PodPort:    podPort,
-				LocalIp:    localIp,
-				LocalPort:  localPort,
-				Hostfile:   opts.Hostfile,
-				ShortName:  opts.ShortName,
-				Remote:     opts.Remote,
-				ExitOnFail: exitOnFail,
+				Out:              publisher,
+				Config:           opts.ClientConfig,
+				ClientSet:        opts.ClientSet,
+				Context:          opts.Context,
+				Namespace:        podNamespace,
+				Service:          svc.Name,
+				PodName:          podName,
+				PodPort:          podPort,
+				LocalIP:          localIP,
+				LocalPort:        localPort,
+				NetworkInterface: opts.NetworkInterface,
+				Hostfile:         opts.Hostfile,
+				ShortName:        opts.ShortName,
+				Remote:           opts.Remote,
+				ExitOnFail:       exitOnFail,
 			}
 
 			opts.Wg.Add(1)
@@ -358,18 +363,39 @@ func fwdServices(opts FwdServiceOpts) error {
 				}
 
 				log.Printf("Stopped forwarding %s in %s.", pfo.Service, pfo.Namespace)
+				deleteIP(localIP, opts.NetworkInterface)
 
 				opts.Wg.Done()
 			}()
-
 		}
 	}
 
 	return nil
 }
 
-func portSearch(portName string, containers []v1.Container) (string, bool) {
+var (
+	mu = sync.Mutex{}
+)
 
+func deleteIP(ip net.IP, iface string) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	args := []string{"addr", "show", iface}
+	out, err := exec.Command("ip", args...).CombinedOutput()
+	if err != nil {
+		log.Printf("Error listing %v IP addresses: %v\n", iface, err)
+	}
+
+	if strings.Index(string(out), ip.String()) != -1 {
+		args = []string{"addr", "del", ip.String(), "dev", iface}
+		if err := exec.Command("ip", args...).Run(); err != nil {
+			log.Printf("Cannot ifconfig %v alias %s down: %v\n", iface, ip.String(), err)
+		}
+	}
+}
+
+func portSearch(portName string, containers []v1.Container) (string, bool) {
 	for _, container := range containers {
 		for _, cp := range container.Ports {
 			if cp.Name == portName {

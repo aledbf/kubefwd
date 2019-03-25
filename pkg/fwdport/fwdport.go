@@ -22,16 +22,20 @@ import (
 )
 
 type PortForwardOpts struct {
-	Out        *fwdpub.Publisher
-	Config     *restclient.Config
-	ClientSet  *kubernetes.Clientset
-	Context    string
-	Namespace  string
-	Service    string
-	PodName    string
-	PodPort    string
-	LocalIp    net.IP
-	LocalPort  string
+	Out       *fwdpub.Publisher
+	Config    *restclient.Config
+	ClientSet *kubernetes.Clientset
+	Context   string
+	Namespace string
+	Service   string
+	PodName   string
+	PodPort   string
+
+	LocalIP   net.IP
+	LocalPort string
+
+	NetworkInterface string
+
 	Hostfile   *txeh.Hosts
 	ExitOnFail bool
 	ShortName  bool
@@ -87,19 +91,19 @@ func PortForward(pfo *PortForwardOpts) error {
 
 	if pfo.ShortName {
 		pfo.Hostfile.RemoveHost(pfo.Service)
-		pfo.Hostfile.AddHost(pfo.LocalIp.String(), pfo.Service)
+		pfo.Hostfile.AddHost(pfo.LocalIP.String(), pfo.Service)
 	}
 
 	pfo.Hostfile.RemoveHost(fullLocalHost)
 	pfo.Hostfile.RemoveHost(nsLocalHost)
 
-	pfo.Hostfile.AddHost(pfo.LocalIp.String(), fullLocalHost)
+	pfo.Hostfile.AddHost(pfo.LocalIP.String(), fullLocalHost)
 
 	if pfo.Remote == false {
 		pfo.Hostfile.RemoveHost(fullLocalHost)
 		pfo.Hostfile.RemoveHost(nsLocalHost)
 
-		pfo.Hostfile.AddHost(pfo.LocalIp.String(), nsLocalHost)
+		pfo.Hostfile.AddHost(pfo.LocalIP.String(), nsLocalHost)
 
 	}
 
@@ -114,6 +118,7 @@ func PortForward(pfo *PortForwardOpts) error {
 			pfo.Hostfile.RemoveHost(localHost)
 			pfo.Hostfile.RemoveHost(nsLocalHost)
 			pfo.Hostfile.RemoveHost(fullLocalHost)
+
 			err = pfo.Hostfile.Save()
 			if err != nil {
 				log.Error("Error saving hosts file", err)
@@ -133,7 +138,7 @@ func PortForward(pfo *PortForwardOpts) error {
 		return err
 	}
 
-	fw.LocalIp(pfo.LocalIp)
+	fw.LocalIp(pfo.LocalIP)
 
 	err = fw.ForwardPorts()
 	if err != nil {
