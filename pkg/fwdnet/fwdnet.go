@@ -3,9 +3,10 @@ package fwdnet
 import (
 	"fmt"
 	"net"
+	"os/exec"
+	"strings"
 
 	util "github.com/apcera/util/iprange"
-	"github.com/sparrc/go-ping"
 )
 
 var (
@@ -33,21 +34,10 @@ func Allocate(iprange string) (net.IP, error) {
 
 		allocated[ip.String()] = true
 
-		pinger, err := ping.NewPinger(ip.String())
-		if err != nil {
-			panic(err)
+		out, _ := exec.Command("ping", ip.String(), "-c 2", "-w 10").Output()
+		if strings.Contains(string(out), "Destination Host Unreachable") {
+			return ip, nil
 		}
-		pinger.Count = 3
-		pinger.SetPrivileged(false)
-		pinger.Run()
-
-		stats := pinger.Statistics()
-		if stats.PacketsRecv == 3 {
-			// alive
-			continue
-		}
-
-		return ip, nil
 	}
 
 	return nil, fmt.Errorf("No IP addresses available")
